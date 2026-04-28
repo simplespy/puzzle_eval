@@ -33,48 +33,87 @@ import chess
 import pandas as pd
 from tqdm import tqdm
 
-# ---- Prompt builders (must match training format) --------------------------
+def _system_prompt(format_name: str) -> str:
+    """Reproduces optimal_move_system_message from training."""
+    base_inst = (
+        "You are a helpful assistant who plays chess professionally. "
+        "First, think through the reasoning process internally and then provide the user with the best move. "
+        "The reasoning process and the answer must be enclosed within <think> </think> and <answer> </answer> tags, respectively."
+    )
+    reasoning_inst = "\n".join([
+        "The reasoning process should describe how you analyze the position and decide on the best move, including:",
+        "- A strategic evaluation of the position.",
+        "- A comparison of key candidate moves.",
+        "- For each candidate, consider the opponent's likely response and outcome.",
+        "- Conclude with a clear justification for the final choice.",
+    ])
+    format_inst = (
+        "The answer must be in SAN notation, restricted to the moving piece and "
+        "destination square (e.g., Nf3, Rxf2, c5)."
+    )
+    # include_legal_moves=True branch
+    context_info = (
+        f"Now, the user provides the board in {format_name} format, "
+        f"a list of legal moves for the given board."
+    )
+    final_inst = (
+        "After analyzing the position, clearly state the best move in SAN "
+        "notation within <answer> </answer> tags. i.e., <answer> Nf3 </answer>."
+    )
+    rules_reminder = "\n".join([
+        "Reminder of chess rules:",
+        "- Bishops move diagonally.",
+        "- Rooks move horizontally or vertically.",
+        "- Knights jump in an L-shape.",
+        "- Queens combine rook and bishop movements.",
+        "- Kings move one square in any direction.",
+        "- Pawns move forward, capture diagonally, and can promote.",
+    ])
+    return "\n".join([
+        base_inst, reasoning_inst, format_inst,
+        context_info, final_inst, rules_reminder,
+    ]).strip()
 
-# Matches the optimal_move_fen prompt structure from training.
-SYSTEM_PROMPT_FEN = (
-    "You are a helpful assistant who plays chess professionally. First, think "
-    "through the reasoning process internally and then provide the user with "
-    "the best move. The reasoning process and the answer must be enclosed "
-    "within <think> </think> and <answer> </answer> tags, respectively.\n"
-    "The reasoning process should describe how you analyze the position and "
-    "decide on the best move, including:\n"
-    "- A strategic evaluation of the position.\n"
-    "- A comparison of key candidate moves.\n"
-    "- For each candidate, consider the opponent's likely response and outcome.\n"
-    "- Conclude with a clear justification for the final choice.\n"
-    "The answer must be in SAN notation, restricted to the moving piece and "
-    "destination square (e.g., Nf3, Rxf2, c5).\n"
-    "Now, the user provides the board in FEN format.\n"
-    "After analyzing the position, clearly state the best move in SAN notation "
-    "within <answer> </answer> tags. i.e., <answer> Nf3 </answer>.\n"
-    "Reminder of chess rules:\n"
-    "- Bishops move diagonally.\n"
-    "- Rooks move horizontally or vertically.\n"
-    "- Knights jump in an L-shape.\n"
-    "- Queens combine rook and bishop movements.\n"
-    "- Kings move one square in any direction.\n"
-    "- Pawns move forward, capture diagonally, and can promote."
-)
+
+SYSTEM_PROMPT_FEN = _system_prompt("FEN")
+SYSTEM_PROMPT_ASCII = _system_prompt("ASCII")
 
 
-def build_user_message_fen(fen: str) -> str:
-    # Training FEN uses 4-field format (no halfmove/fullmove counters)
-    trimmed = " ".join(fen.split()[:4])
-    return f"Current board in FEN: {trimmed}."
+def _legal_moves_san(board: chess.Board) -> str:
+    """Space-separated SAN list, matching training data ordering."""
+    return " ".join(board.san(m) for m in board.legal_moves)
+
+
+def _build_user_message(fen: str, task: str) -> str:
+    """Build the user message exactly matching training format.
+
+    The trailing '..' for ASCII (single period after str(board) which already
+    ends with '.') is intentional — it reproduces the f-string in training.
+    """
+    # Training uses 4-field FEN
+    trimmed_fen = " ".join(fen.split()[:4])
+    board = chess.Board(fen)
+    legal = _legal_moves_san(board)
+
+    if task == "optimal_move_fen":
+        return f"Current board in FEN: {trimmed_fen}.\nLegal moves: {legal}."
+    if task == "optimal_move_ascii":
+        ascii_board = str(board)
+        return f"Current board in ASCII: {ascii_board}.\nLegal moves: {legal}."
+    raise ValueError(f"Unsupported task: {task}")
 
 
 def build_chat(fen: str, task: str = "optimal_move_fen"):
     if task == "optimal_move_fen":
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT_FEN},
-            {"role": "user", "content": build_user_message_fen(fen)},
-        ]
-    raise ValueError(f"Unsupported task: {task}. Add prompt builder if needed.")
+        system = SYSTEM_PROMPT_FEN
+    elif task == "optimal_move_ascii":
+        system = SYSTEM_PROMPT_ASCII
+    else:
+        raise ValueError(f"Unsupported task: {task}")
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": _build_user_message(fen, task)},
+    ]
 
 
 # ---- vLLM setup helpers (mirrored from eval_fast.py) -----------------------
@@ -240,24 +279,52 @@ def check_format(text: str) -> dict:
 
 
 def san_to_uci(san, fen):
-    """Convert SAN -> UCI given the board at `fen`. Returns (uci, status)."""
+    """Convert SAN -> UCI given the board at `fen`. Returns (uci, status).
+
+    Status values:
+      - ok           : valid legal move
+      - empty        : empty/None input
+      - bad_fen      : FEN couldn't be parsed
+      - illegal_move : SAN is well-formed but the move is not legal here
+                       (model picked a move not actually playable — typical
+                       failure mode for hallucinated moves like 'Qe6' when
+                       the queen can't reach e6)
+      - ambiguous    : well-formed SAN but matches multiple legal moves
+      - parse_fail   : SAN is malformed / not parseable
+    """
     if san is None or san == "":
         return None, "empty"
     try:
         board = chess.Board(fen)
     except ValueError:
         return None, "bad_fen"
-    try:
-        move = board.parse_san(san)
-    except Exception:
-        cleaned = san.split()[0] if san.split() else san
+
+    # Try parsing the cleaned-up SAN. We try the original first, then the
+    # first whitespace-separated token (handles trailing junk).
+    candidates = [san]
+    first_token = san.split()[0] if san.split() else ""
+    if first_token and first_token != san:
+        candidates.append(first_token)
+
+    last_status = "parse_fail"
+    for cand in candidates:
         try:
-            move = board.parse_san(cleaned)
+            move = board.parse_san(cand)
+            if move not in board.legal_moves:
+                # parse_san already enforces legality, so this should be
+                # unreachable, but keep it for safety.
+                last_status = "illegal_move"
+                continue
+            return move.uci(), "ok"
+        except chess.IllegalMoveError:
+            last_status = "illegal_move"
+        except chess.AmbiguousMoveError:
+            last_status = "ambiguous"
+        except (chess.InvalidMoveError, ValueError):
+            last_status = "parse_fail"
         except Exception:
-            return None, "parse_fail"
-    if move not in board.legal_moves:
-        return None, "illegal_move"
-    return move.uci(), "ok"
+            last_status = "parse_fail"
+    return None, last_status
 
 
 # ---- Main ------------------------------------------------------------------
@@ -272,7 +339,7 @@ def main():
     ap.add_argument("--output", type=Path, required=True,
                     help="Output predictions.parquet path")
     ap.add_argument("--task", type=str, default="optimal_move_fen",
-                    choices=["optimal_move_fen"],
+                    choices=["optimal_move_fen", "optimal_move_ascii"],
                     help="Prompt template. Matches eval_fast.py task names.")
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--max-new-tokens", type=int, default=4096)
